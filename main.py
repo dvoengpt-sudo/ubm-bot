@@ -13,6 +13,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
+import sys
+import platform
 
 
 # --- tiny web server for uptime pings ---
@@ -31,6 +33,13 @@ async def run_web_app():
     await site.start()
     print(f"Web server started on port {port}")
 
+# держим задачу живой
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        print("[web] shutting down...", flush=True)
+        raise
 
 # === env/paths ===
 BASE_DIR = Path(__file__).resolve().parent
@@ -476,6 +485,7 @@ async def main():
         dp.start_polling(bot),
         run_web_app(),
     )
+
 
 
 
