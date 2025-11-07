@@ -471,20 +471,40 @@ async def cmd_stats(message: Message):
         )
 
 
-# === run ===
+async def run_bot(bot: Bot):
+    # перезапуск бота, если он вдруг упадёт
+    while True:
+        try:
+            print("[bot] starting polling...")
+            await dp.start_polling(bot)
+        except Exception as e:
+            print("[bot] crashed:", repr(e))
+            # небольшая пауза и пробуем снова
+            await asyncio.sleep(5)
+        else:
+            # если polling завершился корректно — выходим из цикла
+            print("[bot] polling finished gracefully")
+            break
+
 async def main():
     await init_db()
-    if not BOT_TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN в .env / переменных окружения")
 
-    bot = Bot(BOT_TOKEN)
-    print("Bot started.")
+    BOT = (BOT_TOKEN or "").strip()
+    if not BOT:
+        raise RuntimeError("Не задан BOT_TOKEN в переменных окружения (Render → Environment).")
 
-    # запускаем бота и веб-сервер параллельно
-    await asyncio.gather(
-        dp.start_polling(bot),
-        run_web_app(),
-    )
+    # стартуем веб-сервер СНАЧАЛА, чтобы Render видел порт и не убил процесс
+    web_task = asyncio.create_task(run_web_app())
+
+    bot = Bot(BOT)
+    print("[main] Bot token length:", len(BOT))
+
+    # запускаем бота параллельно
+    bot_task = asyncio.create_task(run_bot(bot))
+
+    # держим оба таска
+    await asyncio.gather(web_task, bot_task)
+
 
 
 
