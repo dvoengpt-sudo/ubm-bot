@@ -1,71 +1,44 @@
+# main.py — Python 3.12 + aiogram v3
+
 import asyncio
 import os
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+
+import aiosqlite
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-import aiosqlite
-from dotenv import load_dotenv
 
 
-# ====== БАЗОВЫЕ НАСТРОЙКИ / .env ======
+# === env/paths ===
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env", override=True)  # грузим .env из папки скрипта
+load_dotenv(BASE_DIR / ".env", override=True)
 
-def _parse_list_env(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [x.strip() for x in value.split(",") if x.strip()]
-
-def _parse_int_set_env(value: str | None) -> set[int]:
-    result: set[int] = set()
-    if not value:
-        return result
-    for part in value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            result.add(int(part))
-        except ValueError:
-            # пропускаем некорректные id
-            continue
-    return result
-
-
-# ЧИТАЕМ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в .env")
-
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "refbot.sqlite3"))
-ADMIN_IDS: set[int] = _parse_int_set_env(os.getenv("ADMIN_IDS"))
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 BONUS_PER_REF = float(os.getenv("BONUS_PER_REF", "1.0"))
-PAYOUT_TARGET = int(os.getenv("PAYOUT_TARGET", "10"))
+PAYOUT_TARGET = int(os.getenv("PAYOUT_TARGET", "600"))
 
-# Каналы/группы для обязательной подписки:
-# Пример: SUB_CHANNELS=@your_public_channel,-1001234567890
-SUB_CHANNELS_RAW: list[str] = _parse_list_env(os.getenv("SUB_CHANNELS"))
+SUB_CHANNELS_RAW = [ch.strip() for ch in os.getenv("SUB_CHANNELS", "").split(",") if ch.strip()]
 
-# То же, но приведённое к типам для get_chat_member:
-# публичные оставляем как строки "@name", числовые id приводим к int
-SUB_CHANNELS: list[int | str] = []
-for ch in SUB_CHANNELS_RAW:
-    if ch.startswith("@"):
-        SUB_CHANNELS.append(ch)
-    else:
-        try:
-            SUB_CHANNELS.append(int(ch))
-        except ValueError:
-            # некорректный элемент пропускаем
-            continue
+def _to_chat_id(val: str) -> int | str:
+    if val.startswith("@"):
+        return val
+    try:
+        return int(val)
+    except ValueError:
+        return val
+
+SUB_CHANNELS = [_to_chat_id(v) for v in SUB_CHANNELS_RAW]
+
+DB_PATH = str(BASE_DIR / "refbot.sqlite3")
 
 
-# ====== МОДЕЛИ ======
+# === models ===
 @dataclass
 class User:
     user_id: int
@@ -76,7 +49,7 @@ class User:
     joined_at: str
 
 
-# ====== SQL ======
+# === db schema ===
 INIT_SQL = """
 PRAGMA journal_mode=WAL;
 
@@ -96,7 +69,6 @@ CREATE TABLE IF NOT EXISTS referrals (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
--- Ожидающие рефералы (когда нет подписки)
 CREATE TABLE IF NOT EXISTS pending_refs (
     referred_id INTEGER PRIMARY KEY,
     referrer_id INTEGER NOT NULL,
@@ -107,18 +79,15 @@ CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
 """
 
 
-def get_db() -> aiosqlite.Connection:
-    # aiosqlite.connect поддерживает async with
+# === db helpers ===
+def get_db():
     return aiosqlite.connect(DB_PATH)
 
-
-async def init_db() -> None:
+async def init_db():
     async with get_db() as db:
         await db.executescript(INIT_SQL)
         await db.commit()
 
-
-# ====== УТИЛИТЫ ======
 async def ensure_user(db: aiosqlite.Connection, tg_user) -> tuple[bool, User]:
     await db.execute(
         "INSERT OR IGNORE INTO users(user_id, username) VALUES (?, ?)",
@@ -138,27 +107,26 @@ async def ensure_user(db: aiosqlite.Connection, tg_user) -> tuple[bool, User]:
     row = await cur.fetchone()
     u = User(*row)
     try:
-        # SQLite CURRENT_TIMESTAMP = 'YYYY-MM-DD HH:MM:SS'
         joined = dt.datetime.fromisoformat(u.joined_at.replace(" ", "T"))
         is_new = (dt.datetime.utcnow() - joined).total_seconds() < 30
     except Exception:
         is_new = False
     return is_new, u
 
-
 async def apply_referral(db: aiosqlite.Connection, referrer_id: int, referred_id: int) -> bool:
     """
-    Начисляет реферальное событие:
-      - создаёт запись в referrals (уникальна по referred_id)
-      - +1 реферал и +BONUS_PER_REF на балансе у РЕФЕРЕРА
-      - проставляет ref_by у ПРИГЛАШЁННОГО (если ещё не стоял)
+    Засчитывает рефералку ровно один раз:
+      - запись в referrals (UNIQUE по referred_id)
+      - у приглашённого (referred) выставляем ref_by, если ещё не выставлен
+      - у реферера инкрементируем referrals_count и баланс
     """
     if referrer_id == referred_id:
         return False
 
-    # убедимся, что обе стороны существуют в users
-    await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (referrer_id,))
-    await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (referred_id,))
+    # гарантируем, что реферер существует в users
+    cur = await db.execute("SELECT 1 FROM users WHERE user_id=?", (referrer_id,))
+    if await cur.fetchone() is None:
+        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (referrer_id,))
 
     try:
         await db.execute(
@@ -166,28 +134,29 @@ async def apply_referral(db: aiosqlite.Connection, referrer_id: int, referred_id
             (referrer_id, referred_id),
         )
     except aiosqlite.IntegrityError:
-        # Уже засчитан ранее (unique по referred_id)
+        # уже есть запись по этому referred_id
         return False
 
-    # +статистика рефереру
-    await db.execute(
-        "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + ? "
-        "WHERE user_id = ?",
-        (BONUS_PER_REF, referrer_id),
-    )
-    # отметим, кто пригласил, у приглашённого (если ещё пусто)
+    # привязываем приглашённого к рефереру (только если ещё не привязан)
     await db.execute(
         "UPDATE users SET ref_by = COALESCE(ref_by, ?) WHERE user_id = ?",
         (referrer_id, referred_id),
     )
+
+    # начисляем рефереру
+    await db.execute(
+        "UPDATE users SET referrals_count = referrals_count + 1, balance = balance + ? WHERE user_id = ?",
+        (BONUS_PER_REF, referrer_id),
+    )
+
     await db.commit()
     return True
 
 
+# === botside helpers ===
 async def get_bot_username(bot: Bot) -> str:
     me = await bot.get_me()
     return me.username or ""
-
 
 def profile_line(u: User) -> str:
     need = max(0, PAYOUT_TARGET - u.referrals_count)
@@ -198,38 +167,24 @@ def profile_line(u: User) -> str:
         f"🎯 До цели {PAYOUT_TARGET}: <b>{need}</b>"
     )
 
-
-# --- Проверка подписки ---
 async def is_member_of(bot: Bot, chat_id: int | str, user_id: int) -> bool:
-    """
-    True если юзер состоит в канале/группе.
-    Для приватных каналов бот должен быть админом. Для публичных — хотя бы членом.
-    """
     try:
         cm = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
     except Exception:
         return False
-
     status = getattr(cm, "status", None)
-    # Aiogram v3 возвращает ChatMember с полем status ('member', 'administrator', 'creator', 'left', 'kicked')
     return status in ("member", "administrator", "creator")
-
 
 async def is_subscribed_everywhere(bot: Bot, user_id: int) -> bool:
     if not SUB_CHANNELS:
         return True
-    results: list[bool] = []
+    results = []
     for ch in SUB_CHANNELS:
         ok = await is_member_of(bot, ch, user_id)
         results.append(ok)
     return all(results)
 
-
 def sub_keyboard() -> InlineKeyboardMarkup:
-    """
-    Клавиатура с кнопками подписки (по сырой строке), плюс кнопка "Проверил".
-    Для '@public' даём прямую ссылку, для приватных/числовых — заглушка на t.me.
-    """
     buttons: list[list[InlineKeyboardButton]] = []
     for ch in SUB_CHANNELS_RAW:
         if ch.startswith("@"):
@@ -240,14 +195,53 @@ def sub_keyboard() -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="✅ Проверил подписку", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+async def notify_admins(bot: Bot, text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            pass
 
-# ====== ХЭНДЛЕРЫ ======
+
+# === auto-check subscription ===
+async def auto_check_after_delay(bot: Bot, user_id: int) -> None:
+    await asyncio.sleep(15)
+    if not await is_subscribed_everywhere(bot, user_id):
+        return
+
+    async with get_db() as db:
+        cur = await db.execute("SELECT referrer_id FROM pending_refs WHERE referred_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            return
+
+        referrer_id = row[0]
+        applied = await apply_referral(db, referrer_id, user_id)
+        await db.execute("DELETE FROM pending_refs WHERE referred_id=?", (user_id,))
+        await db.commit()
+
+        if applied:
+            try:
+                await bot.send_message(
+                    user_id,
+                    "✅ Подписка подтверждена автоматически, рефералка начислена!"
+                )
+            except Exception:
+                pass
+            await notify_admins(
+                bot,
+                f"🎉 Реферал (автопроверка 15с):\n"
+                f"Реферер: <code>{referrer_id}</code>\n"
+                f"Приглашённый: <code>{user_id}</code>"
+            )
+
+
+# === dp / handlers ===
 dp = Dispatcher()
-
 
 @dp.message(CommandStart())
 async def on_start(message: Message, bot: Bot):
-    # Разбор payload: /start <payload>
+    # payload из /start
     payload = ""
     if message.text:
         rest = message.text.strip()
@@ -257,28 +251,27 @@ async def on_start(message: Message, bot: Bot):
     async with get_db() as db:
         is_new, u = await ensure_user(db, message.from_user)
 
-        # Сначала проверим подписку
         subscribed = await is_subscribed_everywhere(bot, u.user_id)
 
-        # Если есть payload — сохраним потенциального реферера в pending, пока нет подписки
         ref_applied = False
+        referrer_id: int | None = None
+
         if payload and payload.isdigit():
             referrer_id = int(payload)
-            if referrer_id == u.user_id:
-                ref_applied = False  # самореферал не засчитываем
-            elif subscribed:
-                ref_applied = await apply_referral(db, referrer_id, u.user_id)
-            else:
-                await db.execute(
-                    "INSERT OR REPLACE INTO pending_refs(referred_id, referrer_id) VALUES (?, ?)",
-                    (u.user_id, referrer_id),
-                )
-                await db.commit()
+            if referrer_id != u.user_id:
+                if subscribed:
+                    ref_applied = await apply_referral(db, referrer_id, u.user_id)
+                else:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO pending_refs(referred_id, referrer_id) VALUES (?, ?)",
+                        (u.user_id, referrer_id),
+                    )
+                    await db.commit()
 
         bot_username = await get_bot_username(bot)
         link = f"https://t.me/{bot_username}?start={u.user_id}" if bot_username else "—"
 
-        parts: list[str] = ["👋 Добро пожаловать!"]
+        parts = ["👋 Добро пожаловать!"]
         if not subscribed and SUB_CHANNELS:
             parts += [
                 "Чтобы пользоваться ботом и получить реферал-бонус — подпишись на каналы ниже:",
@@ -289,8 +282,16 @@ async def on_start(message: Message, bot: Bot):
 
         if ref_applied:
             parts.append("✅ Твоя рефералка засчитана!")
+            # уведомим админов
+            if referrer_id is not None:
+                await notify_admins(
+                    bot,
+                    f"🎉 Новый реферал!\n"
+                    f"Реферер: <code>{referrer_id}</code>\n"
+                    f"Приглашённый: <code>{u.user_id}</code>"
+                )
         elif payload and payload.isdigit() and not subscribed and SUB_CHANNELS:
-            parts.append("ℹ️ Рефералка будет засчитана после подписки и нажатия «Проверил подписку».")
+            parts.append("ℹ️ Рефералка будет засчитана после подписки и автопроверки/кнопки.")
         else:
             parts.append("ℹ️ Начисление по реф-ссылке происходит один раз при первом старте.")
 
@@ -314,6 +315,10 @@ async def on_start(message: Message, bot: Bot):
         else:
             await message.answer(text, parse_mode="HTML")
 
+    # автопроверка через 15 сек, если ещё не подписан
+    if not subscribed and SUB_CHANNELS:
+        asyncio.create_task(auto_check_after_delay(bot, u.user_id))
+
 
 @dp.message(Command("check"))
 async def cmd_check(message: Message, bot: Bot):
@@ -321,7 +326,6 @@ async def cmd_check(message: Message, bot: Bot):
     subscribed = await is_subscribed_everywhere(bot, user_id)
     async with get_db() as db:
         if subscribed:
-            # если была в pending — начислим
             cur = await db.execute("SELECT referrer_id FROM pending_refs WHERE referred_id=?", (user_id,))
             row = await cur.fetchone()
             if row:
@@ -331,6 +335,12 @@ async def cmd_check(message: Message, bot: Bot):
                 await db.commit()
                 if applied:
                     await message.answer("✅ Подписка подтверждена, рефералка начислена!")
+                    await notify_admins(
+                        bot,
+                        f"🎉 Реферал (после проверки):\n"
+                        f"Реферер: <code>{referrer_id}</code>\n"
+                        f"Приглашённый: <code>{user_id}</code>"
+                    )
                 else:
                     await message.answer("✅ Подписка подтверждена. Рефералка уже была начислена ранее.")
             else:
@@ -354,6 +364,12 @@ async def cb_check_sub(call: CallbackQuery, bot: Bot):
                 await db.commit()
                 if applied:
                     await call.message.edit_text("✅ Подписка подтверждена, рефералка начислена!")
+                    await notify_admins(
+                        bot,
+                        f"🎉 Реферал (после кнопки):\n"
+                        f"Реферер: <code>{referrer_id}</code>\n"
+                        f"Приглашённый: <code>{user_id}</code>"
+                    )
                 else:
                     await call.message.edit_text("✅ Подписка подтверждена. Рефералка уже была начислена ранее.")
             else:
@@ -373,7 +389,6 @@ async def cmd_ref(message: Message, bot: Bot):
             parse_mode="HTML",
         )
 
-
 @dp.message(Command("me"))
 async def cmd_me(message: Message):
     async with get_db() as db:
@@ -392,7 +407,6 @@ async def cmd_me(message: Message):
             parse_mode="HTML",
         )
 
-
 @dp.message(Command("top"))
 async def cmd_top(message: Message):
     async with get_db() as db:
@@ -410,20 +424,16 @@ async def cmd_top(message: Message):
             lines.append(f"{i}. {uname} — 👥 {refs} | 💰 {bal:.2f}")
         await message.answer("🏆 Топ-10:\n" + "\n".join(lines))
 
-
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("Эта команда только для админов.")
         return
-
     async with get_db() as db:
         cur = await db.execute("SELECT COUNT(*), COALESCE(SUM(referrals_count),0), COALESCE(SUM(balance),0) FROM users")
         total_users, total_refs_by_sum, total_balance = await cur.fetchone()
-
         cur = await db.execute("SELECT COUNT(*) FROM referrals")
         total_ref_events = (await cur.fetchone())[0]
-
         await message.answer(
             "📊 Общая статистика:\n"
             f"Пользователей: <b>{total_users}</b>\n"
@@ -434,13 +444,14 @@ async def cmd_stats(message: Message):
         )
 
 
-# ====== ЗАПУСК ======
+# === run ===
 async def main():
     await init_db()
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в .env / переменных окружения")
     bot = Bot(BOT_TOKEN)
     print("Bot started.")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
