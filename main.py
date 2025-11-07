@@ -15,6 +15,23 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiohttp import web
 
 
+# --- tiny web server for uptime pings ---
+async def health(request: web.Request):
+    return web.json_response({"ok": True})
+
+async def run_web_app():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+
 # === env/paths ===
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env", override=True)
@@ -202,21 +219,6 @@ async def notify_admins(bot: Bot, text: str) -> None:
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
-# --- tiny web server for uptime pings ---
-async def health(request: web.Request):
-    return web.json_response({"ok": True})
-
-async def run_web_app():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    port = int(os.environ.get("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Web server started on port {port}")
 
 
 # === auto-check subscription ===
@@ -474,5 +476,6 @@ async def main():
         dp.start_polling(bot),
         run_web_app(),
     )
+
 
 
