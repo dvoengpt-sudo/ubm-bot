@@ -200,10 +200,9 @@ async def get_bot_username(bot: Bot) -> str:
 def profile_line(u: User) -> str:
     need = max(0, PAYOUT_TARGET - u.referrals_count)
     return (
-        f"👤 Вы: <code>{u.user_id}</code> (@{u.username or '—'})\n"
+        f"👤 Вы: (@{u.username or '—'})\n"
         f"👥 Рефералов: <b>{u.referrals_count}</b>\n"
         f"💰 Баланс: <b>{u.balance:.2f}</b>\n"
-        f"🎯 До цели {PAYOUT_TARGET}: <b>{need}</b>"
     )
 
 async def is_member_of(bot: Bot, chat_id: int | str, user_id: int) -> bool:
@@ -456,3 +455,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
